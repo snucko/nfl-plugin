@@ -1,0 +1,16 @@
+watch:
+  - src
+  - .trmnlp.yml
+
+time_zone: America/New_York
+
+variables:
+  trmnl:
+    plugin_settings:
+      instance_name: NFL Schedule (Local)
+      strategy: polling
+      polling_verb: GET
+      polling_url: https://raw.githubusercontent.com/snucko/nfl/main/data/schedule.json?v={{ system.timestamp_utc }}
+      polling_headers:
+        Accept: application/json
+

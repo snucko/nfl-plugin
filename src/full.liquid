@@ -1,0 +1,35 @@
+<div class="layout"><div class="columns"><div class="column">
+  <span class="label">IDX_0 quick check</span>
+  <table class="table">
+    <tbody>
+      <tr>
+        <td><span class="title title--small">Type of IDX_0</span></td>
+        <td><span class="label">
+          {% if IDX_0.size and IDX_0.first %}array
+          {% elsif IDX_0.season or IDX_0.events %}object
+          {% else %}unknown{% endif %}
+        </span></td>
+      </tr>
+      <tr>
+        <td><span class="title title--small">Season Year</span></td>
+        <td><span class="label">{{ IDX_0.season.year }}</span></td>
+      </tr>
+      <tr>
+        <td><span class="title title--small">Week Number</span></td>
+        <td><span class="label">{{ IDX_0.week.number }}</span></td>
+      </tr>
+      <tr>
+        <td><span class="title title--small">Events Count</span></td>
+        <td><span class="label">{{ IDX_0.events.size | default: 0 }}</span></td>
+      </tr>
+      <tr>
+        <td><span class="title title--small">First Event (name)</span></td>
+        <td><span class="label">{{ IDX_0.events[0].name }}</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <span class="label">Raw dump</span>
+  <pre class="label" style="white-space:pre-wrap">{{ IDX_0 | jsonify }}</pre>
+</div></div></div>
+
