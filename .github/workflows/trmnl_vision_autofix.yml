@@ -1,0 +1,47 @@
+name: TRMNL Vision Auto-Fix
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  autofix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: pip install requests
+
+      - name: Install Node + Playwright
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y npm
+          npx --yes playwright install --with-deps chromium
+
+      - name: Run vision patcher
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_MODEL_URL: https://api-inference.huggingface.co/models/Qwen/Qwen2.5-VL-7B-Instruct
+          APP_URL: http://localhost:4567
+          TRMNL_CONTAINER_NAME: trmnlp
+          AI_PATCH_MAX_ATTEMPTS: "3"
+          WAIT_BOOT_SECS: "10"
+          ACCEPTANCE_HINT: "NFL games should render in the correct sections/columns with accurate team/date labels; no misplacements."
+        run: python tools/ai_vision_patcher.py
+
+      - name: Push changes if any
+        run: |
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git push
+          else
+            echo "No changes."
+          fi
+
