@@ -17,24 +17,35 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python deps
-        run: pip install requests
+      - name: Install Python deps (transformers CPU)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "transformers>=4.41" "accelerate>=0.33" "safetensors" \
+                      "torch==2.3.1+cpu" --index-url https://download.pytorch.org/whl/cpu
+          pip install requests
 
       - name: Install Node + Playwright
         run: |
           sudo apt-get update
           sudo apt-get install -y npm
+          test -f package.json || npm init -y
+          npm install playwright
           npx --yes playwright install --with-deps chromium
 
-      - name: Run vision patcher
+      - name: Run vision patcher (LOCAL mode)
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_MODEL_URL: https://api-inference.huggingface.co/models/Qwen/Qwen2.5-VL-7B-Instruct
+          USE_LOCAL_MODE: "1"        # <— force local BLIP + FLAN-T5
+          ENABLE_VALIDATOR: "0"      # set to "1" if you add DOM validation in the script
+          ACCEPTANCE_HINT: "NFL games should render in the correct sections/columns with accurate team/date labels; no misplacements."
           APP_URL: http://localhost:4567
           TRMNL_CONTAINER_NAME: trmnlp
           AI_PATCH_MAX_ATTEMPTS: "3"
           WAIT_BOOT_SECS: "10"
-          ACCEPTANCE_HINT: "NFL games should render in the correct sections/columns with accurate team/date labels; no misplacements."
+          # HF_* vars unused in local mode
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_MODEL_URL: ""
+          HF_IMAGE2TEXT_URL: ""
+          HF_CODEMODEL_URL: ""
         run: python tools/ai_vision_patcher.py
 
       - name: Push changes if any
