@@ -19,7 +19,13 @@ Environment overrides:
   ACCEPTANCE_HINT="..."
 """
 
-import os, sys, time, base64, pathlib, re, tempfile, subprocess
+import os
+import sys
+import time
+import pathlib
+import re
+import tempfile
+import subprocess
 
 # ----- Paths & scope -----
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -27,6 +33,8 @@ ALLOWED_DIRS = [ROOT / "src", ROOT / "sample"]
 ALLOWED_FILES = {ROOT / ".trmnlp.yml"}
 ARTIFACTS_DIR = ROOT / "artifacts"
 SCREENSHOT_PATH = ARTIFACTS_DIR / "plugin_screenshot.png"
+RAW_MODEL_OUT = ARTIFACTS_DIR / "raw_model_output.txt"
+LAST_DIFF = ARTIFACTS_DIR / "last_diff.patch"
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ----- TRMNL container settings -----
@@ -50,12 +58,17 @@ CAPTION_MODEL_ID = os.getenv("CAPTION_MODEL_ID", "Salesforce/blip-image-captioni
 TEXT_MODEL_ID = os.getenv("TEXT_MODEL_ID", "google/flan-t5-base")
 TEXT_MODEL_ARCH = os.getenv("TEXT_MODEL_ARCH", "seq2seq").lower()  # "seq2seq" or "causal"
 
+# Prefer safetensors everywhere (helps avoid torch.load on .bin)
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+
 # ===== Utilities =====
 def run(cmd: str, check: bool = True) -> subprocess.CompletedProcess:
     print(f"$ {cmd}")
     p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if p.stdout: print(p.stdout)
-    if p.stderr: print(p.stderr, file=sys.stderr)
+    if p.stdout:
+        print(p.stdout)
+    if p.stderr:
+        print(p.stderr, file=sys.stderr)
     if check and p.returncode != 0:
         raise SystemExit(p.returncode)
     return p
@@ -105,14 +118,13 @@ def list_files():
     return files
 
 def read_snapshot():
-    return {p.relative_to(ROOT).as_posix(): p.read_text(encoding="utf-8", errors="ignore")
-            for p in list_files()}
+    return {
+        p.relative_to(ROOT).as_posix(): p.read_text(encoding="utf-8", errors="ignore")
+        for p in list_files()
+    }
 
-def make_prompt(snap: dict[str,str], hint: str) -> str:
+def make_prompt(snap: dict[str, str], hint: str) -> str:
     inv = "\n".join(f"- {k}" for k in sorted(snap.keys()))
-    # You can embed a truncated file to help the model anchor edits:
-    # code_preview = (ROOT / "src" / "full.liquid").read_text(encoding="utf-8", errors="ignore").splitlines()[:400]
-    # code_preview_text = "\n".join(code_preview)
     return (
         "You are an automated code patcher for a TRMNL plugin.\n"
         "Return ONLY a valid unified diff. No prose. No backticks. No explanations.\n"
@@ -130,14 +142,17 @@ def make_prompt(snap: dict[str,str], hint: str) -> str:
         "\n"
         "Repo file inventory:\n" + inv + "\n\n"
         "Acceptance:\n" + hint + "\n"
-        # "\nRelevant file (truncated 400 lines):\n" + code_preview_text + "\n"
     )
 
 # ===== Local caption + diff =====
 def call_local_caption_and_diff(image_path: pathlib.Path, prompt: str) -> str:
+    # Caption the screenshot
     from transformers import pipeline, AutoTokenizer
-    # Caption
-    cap = pipeline("image-to-text", model=CAPTION_MODEL_ID)
+    cap = pipeline(
+        "image-to-text",
+        model=CAPTION_MODEL_ID,
+        model_kwargs={"use_safetensors": True}
+    )
     caption = cap(str(image_path))[0]["generated_text"]
 
     strict = (
@@ -146,10 +161,11 @@ def call_local_caption_and_diff(image_path: pathlib.Path, prompt: str) -> str:
         f"Screenshot caption: {caption}\n\n" + prompt
     )
 
+    # Generate the diff text
     if TEXT_MODEL_ARCH == "causal":
         from transformers import AutoModelForCausalLM
         tok = AutoTokenizer.from_pretrained(TEXT_MODEL_ID)
-        mdl = AutoModelForCausalLM.from_pretrained(TEXT_MODEL_ID)
+        mdl = AutoModelForCausalLM.from_pretrained(TEXT_MODEL_ID, use_safetensors=True)
         inputs = tok(strict, return_tensors="pt")
         out = mdl.generate(
             **inputs,
@@ -159,11 +175,11 @@ def call_local_caption_and_diff(image_path: pathlib.Path, prompt: str) -> str:
             repetition_penalty=1.05,
             eos_token_id=tok.eos_token_id,
         )
-        return tok.decode(out[0], skip_special_tokens=True).strip()
+        txt = tok.decode(out[0], skip_special_tokens=True).strip()
     else:
         from transformers import AutoModelForSeq2SeqLM
         tok = AutoTokenizer.from_pretrained(TEXT_MODEL_ID)
-        mdl = AutoModelForSeq2SeqLM.from_pretrained(TEXT_MODEL_ID)
+        mdl = AutoModelForSeq2SeqLM.from_pretrained(TEXT_MODEL_ID, use_safetensors=True)
         inputs = tok(strict, return_tensors="pt", truncation=True)
         out = mdl.generate(
             **inputs,
@@ -172,7 +188,11 @@ def call_local_caption_and_diff(image_path: pathlib.Path, prompt: str) -> str:
             num_beams=1,
             repetition_penalty=1.05,
         )
-        return tok.decode(out[0], skip_special_tokens=True).strip()
+        txt = tok.decode(out[0], skip_special_tokens=True).strip()
+
+    # Save raw model output for debugging
+    RAW_MODEL_OUT.write_text(txt, encoding="utf-8")
+    return txt
 
 # ===== Diff helpers =====
 def is_valid_diff(diff_text: str) -> bool:
@@ -216,9 +236,8 @@ def diff_targets_allowed_paths(diff_text: str) -> bool:
 def apply_unified_diff(diff_text: str):
     # Always save what we got for debugging
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    last = ARTIFACTS_DIR / "last_diff.patch"
-    last.write_text(diff_text, encoding="utf-8")
-    print(f"📝 wrote patch to {last}")
+    LAST_DIFF.write_text(diff_text, encoding="utf-8")
+    print(f"📝 wrote patch to {LAST_DIFF}")
 
     if not is_valid_diff(diff_text):
         return False, "Invalid diff (missing header/hunks/+/-)."
@@ -228,7 +247,8 @@ def apply_unified_diff(diff_text: str):
     with tempfile.TemporaryDirectory() as td:
         patch = pathlib.Path(td) / "patch.diff"
         patch.write_text(diff_text, encoding="utf-8")
-        p = subprocess.run(["git","apply","--index",str(patch)], cwd=ROOT, capture_output=True, text=True)
+        p = subprocess.run(["git", "apply", "--index", str(patch)],
+                           cwd=ROOT, capture_output=True, text=True)
         if p.returncode != 0:
             return False, f"git apply failed:\n{p.stdout}\n{p.stderr}"
     return True, "Applied."
@@ -250,7 +270,7 @@ def main():
         "Each NFL game must render under the correct section/column with correct team names, dates, and ordering."
     )
 
-    for i in range(1, MAX_ATTEMPTS+1):
+    for i in range(1, MAX_ATTEMPTS + 1):
         print(f"\n=== Patch Attempt {i}/{MAX_ATTEMPTS} ===")
         prompt = make_prompt(read_snapshot(), acceptance_hint)
 

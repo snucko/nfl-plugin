@@ -10,7 +10,7 @@ jobs:
     permissions:
       contents: write
     env:
-      # Keep model/cache out of the repo tree we commit
+      # Keep caches outside tracked paths
       CACHE_ROOT: ${{ github.workspace }}/.gh-cache
       HF_HOME: ${{ github.workspace }}/.gh-cache/huggingface
       TRANSFORMERS_CACHE: ${{ github.workspace }}/.gh-cache/huggingface/transformers
@@ -29,11 +29,14 @@ jobs:
       TEXT_MODEL_ID: "google/flan-t5-large"
       TEXT_MODEL_ARCH: "seq2seq"   # "seq2seq" or "causal"
 
+      # Prefer safetensors everywhere
+      HF_HUB_ENABLE_HF_TRANSFER: "1"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare cache directories (outside tracked paths)
+      - name: Prepare cache directories
         run: |
           mkdir -p "$CACHE_ROOT" "$HF_HOME" "$TRANSFORMERS_CACHE" "$TORCH_HOME"
 
@@ -42,10 +45,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python deps (CPU)
+      - name: Install Python deps (CPU, torch>=2.6 for CVE fix)
         run: |
           python -m pip install --upgrade pip
-          pip install "torch==2.3.1+cpu" --index-url https://download.pytorch.org/whl/cpu
+          pip install "torch==2.8.0" --index-url https://download.pytorch.org/whl/cpu
           pip install "transformers>=4.41" "accelerate>=0.33" pillow requests
 
       - name: Install Node + Playwright (Chromium)
