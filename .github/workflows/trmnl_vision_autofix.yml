@@ -29,9 +29,6 @@ jobs:
       TEXT_MODEL_ID: "google/flan-t5-large"
       TEXT_MODEL_ARCH: "seq2seq"   # "seq2seq" or "causal"
 
-      # Prefer safetensors everywhere
-      HF_HUB_ENABLE_HF_TRANSFER: "1"
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
