@@ -1,25 +1,56 @@
 #!/usr/bin/env python3
+"""
+Vision-aware auto-patcher for TRMNL plugins (Liquid + YAML/JSON).
+
+Local mode (USE_LOCAL_MODE=1):
+  - Captions screenshot with BLIP (Salesforce/blip-image-captioning-base by default)
+  - Generates unified diff with a text model (google/flan-t5-base by default)
+  - No Hugging Face API calls; runs on CPU with transformers.
+
+Environment overrides:
+  USE_LOCAL_MODE=1
+  CAPTION_MODEL_ID=Salesforce/blip-image-captioning-base
+  TEXT_MODEL_ID=google/flan-t5-base
+  TEXT_MODEL_ARCH=seq2seq            # or "causal"
+  APP_URL=http://localhost:4567
+  TRMNL_CONTAINER_NAME=trmnlp
+  AI_PATCH_MAX_ATTEMPTS=3
+  WAIT_BOOT_SECS=10
+  ACCEPTANCE_HINT="..."
+"""
+
 import os, sys, time, base64, pathlib, re, tempfile, subprocess
 
+# ----- Paths & scope -----
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ALLOWED_DIRS = [ROOT / "src", ROOT / "sample"]
 ALLOWED_FILES = {ROOT / ".trmnlp.yml"}
-SCREENSHOT_PATH = ROOT / "artifacts" / "plugin_screenshot.png"
-SCREENSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+ARTIFACTS_DIR = ROOT / "artifacts"
+SCREENSHOT_PATH = ARTIFACTS_DIR / "plugin_screenshot.png"
+ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# ----- TRMNL container settings -----
 APP_URL = os.getenv("APP_URL", "http://localhost:4567")
 CONTAINER_NAME = os.getenv("TRMNL_CONTAINER_NAME", "trmnlp")
-START_CMD = os.getenv("START_CMD",
+START_CMD = os.getenv(
+    "START_CMD",
     f"docker rm -f {CONTAINER_NAME} >/dev/null 2>&1 || true && "
     f"docker run --name {CONTAINER_NAME} -d -p 4567:4567 -v \"$PWD:/plugin\" trmnl/trmnlp serve"
 )
 STOP_CMD = os.getenv("STOP_CMD", f"docker rm -f {CONTAINER_NAME} >/dev/null 2>&1 || true")
 WAIT_BOOT_SECS = int(os.getenv("WAIT_BOOT_SECS", "10"))
 
+# ----- Behavior toggles -----
 USE_LOCAL_MODE = os.getenv("USE_LOCAL_MODE", "0") == "1"
 MAX_ATTEMPTS = int(os.getenv("AI_PATCH_MAX_ATTEMPTS", "3"))
 ENABLE_VALIDATOR = os.getenv("ENABLE_VALIDATOR", "0") == "1"
 
+# ----- Models -----
+CAPTION_MODEL_ID = os.getenv("CAPTION_MODEL_ID", "Salesforce/blip-image-captioning-base")
+TEXT_MODEL_ID = os.getenv("TEXT_MODEL_ID", "google/flan-t5-base")
+TEXT_MODEL_ARCH = os.getenv("TEXT_MODEL_ARCH", "seq2seq").lower()  # "seq2seq" or "causal"
+
+# ===== Utilities =====
 def run(cmd: str, check: bool = True) -> subprocess.CompletedProcess:
     print(f"$ {cmd}")
     p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
@@ -79,6 +110,9 @@ def read_snapshot():
 
 def make_prompt(snap: dict[str,str], hint: str) -> str:
     inv = "\n".join(f"- {k}" for k in sorted(snap.keys()))
+    # You can embed a truncated file to help the model anchor edits:
+    # code_preview = (ROOT / "src" / "full.liquid").read_text(encoding="utf-8", errors="ignore").splitlines()[:400]
+    # code_preview_text = "\n".join(code_preview)
     return (
         "You are an automated code patcher for a TRMNL plugin.\n"
         "Return ONLY a valid unified diff. No prose. No backticks. No explanations.\n"
@@ -96,27 +130,55 @@ def make_prompt(snap: dict[str,str], hint: str) -> str:
         "\n"
         "Repo file inventory:\n" + inv + "\n\n"
         "Acceptance:\n" + hint + "\n"
+        # "\nRelevant file (truncated 400 lines):\n" + code_preview_text + "\n"
     )
 
-# -------- Local caption + diff (BLIP + FLAN-T5) --------
+# ===== Local caption + diff =====
 def call_local_caption_and_diff(image_path: pathlib.Path, prompt: str) -> str:
-    from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
-    cap = pipeline("image-to-text", model="Salesforce/blip-image-captioning-base")
+    from transformers import pipeline, AutoTokenizer
+    # Caption
+    cap = pipeline("image-to-text", model=CAPTION_MODEL_ID)
     caption = cap(str(image_path))[0]["generated_text"]
-    tok = AutoTokenizer.from_pretrained("google/flan-t5-base")
-    mdl = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
+
     strict = (
         "You are an automated code patcher. Reply ONLY with a valid unified diff.\n"
         "Start with 'diff --git a/'. No commentary. No backticks.\n\n"
         f"Screenshot caption: {caption}\n\n" + prompt
     )
-    inputs = tok(strict, return_tensors="pt", truncation=True)
-    out = mdl.generate(**inputs, max_new_tokens=512, do_sample=False, num_beams=1, repetition_penalty=1.05)
-    return tok.decode(out[0], skip_special_tokens=True).strip()
 
-# -------- Diff utils --------
+    if TEXT_MODEL_ARCH == "causal":
+        from transformers import AutoModelForCausalLM
+        tok = AutoTokenizer.from_pretrained(TEXT_MODEL_ID)
+        mdl = AutoModelForCausalLM.from_pretrained(TEXT_MODEL_ID)
+        inputs = tok(strict, return_tensors="pt")
+        out = mdl.generate(
+            **inputs,
+            max_new_tokens=600,
+            do_sample=False,
+            num_beams=1,
+            repetition_penalty=1.05,
+            eos_token_id=tok.eos_token_id,
+        )
+        return tok.decode(out[0], skip_special_tokens=True).strip()
+    else:
+        from transformers import AutoModelForSeq2SeqLM
+        tok = AutoTokenizer.from_pretrained(TEXT_MODEL_ID)
+        mdl = AutoModelForSeq2SeqLM.from_pretrained(TEXT_MODEL_ID)
+        inputs = tok(strict, return_tensors="pt", truncation=True)
+        out = mdl.generate(
+            **inputs,
+            max_new_tokens=600,
+            do_sample=False,
+            num_beams=1,
+            repetition_penalty=1.05,
+        )
+        return tok.decode(out[0], skip_special_tokens=True).strip()
+
+# ===== Diff helpers =====
 def is_valid_diff(diff_text: str) -> bool:
     if not re.search(r"^diff --git a/.+ b/.+", diff_text, re.M):
+        return False
+    if not re.search(r"^--- a/.+\n\+\+\+ b/.+", diff_text, re.M):
         return False
     if not re.search(r"^@@ .+ @@", diff_text, re.M):
         return False
@@ -127,9 +189,7 @@ def is_valid_diff(diff_text: str) -> bool:
 def synthesize_noop_diff() -> str:
     """
     Guaranteed-valid no-op patch: append one comment line to end of src/full.liquid
-    Uses a zero-context hunk which always applies:
-      @@ -N,0 +N,1 @@
-      +<line>
+    using a zero-context hunk that always applies.
     """
     target = ROOT / "src" / "full.liquid"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -154,16 +214,14 @@ def diff_targets_allowed_paths(diff_text: str) -> bool:
     return ok
 
 def apply_unified_diff(diff_text: str):
-    artifacts = ROOT / "artifacts"
-    artifacts.mkdir(parents=True, exist_ok=True)
-    last = artifacts / "last_diff.patch"
-
-    # log whatever we’re about to try
+    # Always save what we got for debugging
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    last = ARTIFACTS_DIR / "last_diff.patch"
     last.write_text(diff_text, encoding="utf-8")
     print(f"📝 wrote patch to {last}")
 
     if not is_valid_diff(diff_text):
-        return False, "Invalid diff (missing hunks/+/-)."
+        return False, "Invalid diff (missing header/hunks/+/-)."
     if not diff_targets_allowed_paths(diff_text):
         return False, "Diff targets blocked paths."
 
@@ -175,10 +233,11 @@ def apply_unified_diff(diff_text: str):
             return False, f"git apply failed:\n{p.stdout}\n{p.stderr}"
     return True, "Applied."
 
+# ===== Main =====
 def main():
-    # preflight: Pillow
+    # fail fast if Pillow is missing (used by image pipeline)
     try:
-        import PIL  # noqa
+        import PIL  # noqa: F401
     except Exception:
         print("Missing Pillow. Install with: pip install pillow", file=sys.stderr)
         sys.exit(2)
@@ -196,10 +255,10 @@ def main():
         prompt = make_prompt(read_snapshot(), acceptance_hint)
 
         if not USE_LOCAL_MODE:
-            print("Remote HF API mode disabled in this build.")
+            print("Remote API mode disabled in this build.")
             sys.exit(1)
 
-        print("🧠 Calling local caption+diff (BLIP + FLAN-T5)…")
+        print("🧠 Calling local caption+diff (BLIP + text model)…")
         diff_text = call_local_caption_and_diff(SCREENSHOT_PATH, prompt)
 
         if not is_valid_diff(diff_text):
@@ -210,17 +269,16 @@ def main():
         ok, msg = apply_unified_diff(diff_text)
         print(("✅" if ok else "❌"), msg)
         if not ok:
-            # if even the no-op fails (shouldn’t), bail after logging
-            if not is_valid_diff(diff_text):
-                print("Saved invalid diff at artifacts/last_diff.patch")
             time.sleep(2)
             continue
 
+        # Commit changes
         run('git config user.name "github-actions"', check=False)
         run('git config user.email "github-actions@github.com"', check=False)
         run('git add -A')
         run('git commit -m "🤖 Local auto-patch for TRMNL NFL plugin" || true', check=False)
 
+        # Rebuild & re-screenshot
         start_sim()
         take_screenshot()
         break

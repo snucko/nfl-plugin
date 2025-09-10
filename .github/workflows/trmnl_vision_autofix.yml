@@ -9,22 +9,29 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      # Keep model/cache out of repo
+      HF_HOME: ${{ runner.temp }}/.cache/huggingface
+      TRANSFORMERS_CACHE: ${{ runner.temp }}/.cache/huggingface/transformers
+      TORCH_HOME: ${{ runner.temp }}/.cache/torch
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Python deps (transformers CPU)
+      - name: Install Python deps (CPU)
         run: |
           python -m pip install --upgrade pip
-          pip install "transformers>=4.41" "accelerate>=0.33" "safetensors" \
-                      "torch==2.3.1+cpu" --index-url https://download.pytorch.org/whl/cpu
-          pip install requests
+          # Torch CPU build (faster & smaller than CUDA)
+          pip install "torch==2.3.1+cpu" --index-url https://download.pytorch.org/whl/cpu
+          pip install "transformers>=4.41" "accelerate>=0.33" pillow requests
 
-      - name: Install Node + Playwright
+      - name: Install Node + Playwright (Chromium)
         run: |
           sudo apt-get update
           sudo apt-get install -y npm
@@ -32,20 +39,18 @@ jobs:
           npm install playwright
           npx --yes playwright install --with-deps chromium
 
-      - name: Run vision patcher (LOCAL mode)
+      - name: Run vision patcher (LOCAL mode, BLIP + FLAN-T5)
         env:
-          USE_LOCAL_MODE: "1"        # <— force local BLIP + FLAN-T5
-          ENABLE_VALIDATOR: "0"      # set to "1" if you add DOM validation in the script
+          USE_LOCAL_MODE: "1"        # run locally with transformers
           ACCEPTANCE_HINT: "NFL games should render in the correct sections/columns with accurate team/date labels; no misplacements."
           APP_URL: http://localhost:4567
           TRMNL_CONTAINER_NAME: trmnlp
           AI_PATCH_MAX_ATTEMPTS: "3"
           WAIT_BOOT_SECS: "10"
-          # HF_* vars unused in local mode
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_MODEL_URL: ""
-          HF_IMAGE2TEXT_URL: ""
-          HF_CODEMODEL_URL: ""
+          # Models (override here without code changes)
+          CAPTION_MODEL_ID: "Salesforce/blip-image-captioning-base"
+          TEXT_MODEL_ID: "google/flan-t5-large"
+          TEXT_MODEL_ARCH: "seq2seq"   # "seq2seq" or "causal"
         run: python tools/ai_vision_patcher.py
 
       - name: Push changes if any
