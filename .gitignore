@@ -3,3 +3,14 @@ artifacts/*
 __pycache__/
 *.pyc
 node_modules/
+# envs & caches
+.venv/
+__pycache__/
+*.pyc
+.huggingface/
+.cache/
+# node
+node_modules/
+# build/output
+artifacts/
+playwright/.cache/
