@@ -1,49 +1,23 @@
 #!/usr/bin/env python3
-"""
-Vision-aware auto-patcher for TRMNL plugins (Liquid + YAML/JSON).
+import os, sys, time, base64, pathlib, re, tempfile, subprocess
 
-Local mode (USE_LOCAL_MODE=1):
-  - Captions screenshot with BLIP base
-  - Generates unified diff with FLAN-T5
-  - No Hugging Face API calls, runs entirely on CPU with transformers
-"""
-
-import os
-import sys
-import time
-import base64
-import pathlib
-import re
-import tempfile
-import subprocess
-import requests
-
-# ----- Paths & scope -----
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ALLOWED_DIRS = [ROOT / "src", ROOT / "sample"]
 ALLOWED_FILES = {ROOT / ".trmnlp.yml"}
 SCREENSHOT_PATH = ROOT / "artifacts" / "plugin_screenshot.png"
 SCREENSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-# ----- TRMNL (your docker run) -----
 APP_URL = os.getenv("APP_URL", "http://localhost:4567")
 CONTAINER_NAME = os.getenv("TRMNL_CONTAINER_NAME", "trmnlp")
-START_CMD = os.getenv(
-    "START_CMD",
+START_CMD = os.getenv("START_CMD",
     f"docker rm -f {CONTAINER_NAME} >/dev/null 2>&1 || true && "
     f"docker run --name {CONTAINER_NAME} -d -p 4567:4567 -v \"$PWD:/plugin\" trmnl/trmnlp serve"
 )
 STOP_CMD = os.getenv("STOP_CMD", f"docker rm -f {CONTAINER_NAME} >/dev/null 2>&1 || true")
 WAIT_BOOT_SECS = int(os.getenv("WAIT_BOOT_SECS", "10"))
 
-# ----- Hugging Face (API mode, mostly disabled now) -----
-HF_TOKEN = os.getenv("HF_TOKEN")
-HF_MODEL_URL = os.getenv("HF_MODEL_URL", "")  # blank => skip
-HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
-MAX_ATTEMPTS = int(os.getenv("AI_PATCH_MAX_ATTEMPTS", "3"))
-
-# ----- Local mode toggle -----
 USE_LOCAL_MODE = os.getenv("USE_LOCAL_MODE", "0") == "1"
+MAX_ATTEMPTS = int(os.getenv("AI_PATCH_MAX_ATTEMPTS", "3"))
 ENABLE_VALIDATOR = os.getenv("ENABLE_VALIDATOR", "0") == "1"
 
 def run(cmd: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -69,18 +43,19 @@ def ensure_playwright_installed():
 def take_screenshot(url: str = APP_URL, out: pathlib.Path = SCREENSHOT_PATH):
     shot_js = ROOT / "tools" / "shot.js"
     shot_js.parent.mkdir(parents=True, exist_ok=True)
-    shot_js.write_text("""
-    const { chromium } = require('playwright');
-    (async () => {
-      const browser = await chromium.launch();
-      const context = await browser.newContext({ deviceScaleFactor: 2 });
-      const page = await context.newPage();
-      await page.goto(process.argv[2], { waitUntil: 'networkidle' });
-      await page.waitForTimeout(1500);
-      await page.screenshot({ path: process.argv[3], fullPage: true, type: 'png' });
-      await browser.close();
-    })();
-    """)
+    if not shot_js.exists():
+        shot_js.write_text("""
+const { chromium } = require('playwright');
+(async () => {
+  const browser = await chromium.launch();
+  const context = await browser.newContext({ deviceScaleFactor: 2 });
+  const page = await context.newPage();
+  await page.goto(process.argv[2], { waitUntil: 'networkidle' });
+  await page.waitForTimeout(1500);
+  await page.screenshot({ path: process.argv[3], fullPage: true, type: 'png' });
+  await browser.close();
+})();
+""")
     ensure_playwright_installed()
     run(f"node {shot_js} {url} {out}")
     if not out.exists():
@@ -102,15 +77,23 @@ def read_snapshot():
     return {p.relative_to(ROOT).as_posix(): p.read_text(encoding="utf-8", errors="ignore")
             for p in list_files()}
 
-def encode_image(path: pathlib.Path) -> str:
-    return "data:image/png;base64," + base64.b64encode(path.read_bytes()).decode()
-
 def make_prompt(snap: dict[str,str], hint: str) -> str:
     inv = "\n".join(f"- {k}" for k in sorted(snap.keys()))
     return (
-        "You are an automated code patcher for a TRMNL plugin.\n\n"
-        "Your ENTIRE reply must be ONLY a valid unified diff.\n"
-        "Start with 'diff --git a/'. No prose, no code fences.\n\n"
+        "You are an automated code patcher for a TRMNL plugin.\n"
+        "Return ONLY a valid unified diff. No prose. No backticks. No explanations.\n"
+        "Your first line MUST be exactly: diff --git a/<path> b/<path>\n"
+        "Paths must be relative to repo root shown below.\n\n"
+        "Example format (for illustration only):\n"
+        "diff --git a/src/full.liquid b/src/full.liquid\n"
+        "--- a/src/full.liquid\n"
+        "+++ b/src/full.liquid\n"
+        "@@ -1,3 +1,4 @@\n"
+        "-<div class=\"title\">Old</div>\n"
+        "+<!-- patch -->\n"
+        "+<div class=\"title\">Old</div>\n"
+        " <div class=\"body\">...</div>\n"
+        "\n"
         "Repo file inventory:\n" + inv + "\n\n"
         "Acceptance:\n" + hint + "\n"
     )
@@ -118,22 +101,47 @@ def make_prompt(snap: dict[str,str], hint: str) -> str:
 # -------- Local caption + diff (BLIP + FLAN-T5) --------
 def call_local_caption_and_diff(image_path: pathlib.Path, prompt: str) -> str:
     from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
-    # Caption
     cap = pipeline("image-to-text", model="Salesforce/blip-image-captioning-base")
     caption = cap(str(image_path))[0]["generated_text"]
-    # Diff
     tok = AutoTokenizer.from_pretrained("google/flan-t5-base")
     mdl = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
     strict = (
         "You are an automated code patcher. Reply ONLY with a valid unified diff.\n"
-        "Start with 'diff --git a/'. No commentary.\n\n"
+        "Start with 'diff --git a/'. No commentary. No backticks.\n\n"
         f"Screenshot caption: {caption}\n\n" + prompt
     )
     inputs = tok(strict, return_tensors="pt", truncation=True)
-    out = mdl.generate(**inputs, max_new_tokens=512, temperature=0.2)
+    out = mdl.generate(**inputs, max_new_tokens=512, do_sample=False, num_beams=1, repetition_penalty=1.05)
     return tok.decode(out[0], skip_special_tokens=True).strip()
 
-# -------- Diff handling --------
+# -------- Diff utils --------
+def is_valid_diff(diff_text: str) -> bool:
+    if not re.search(r"^diff --git a/.+ b/.+", diff_text, re.M):
+        return False
+    if not re.search(r"^@@ .+ @@", diff_text, re.M):
+        return False
+    if not re.search(r"^[+-].+", diff_text, re.M):
+        return False
+    return True
+
+def synthesize_noop_diff() -> str:
+    """
+    Guaranteed-valid no-op patch: append one comment line to end of src/full.liquid
+    Uses a zero-context hunk which always applies:
+      @@ -N,0 +N,1 @@
+      +<line>
+    """
+    target = ROOT / "src" / "full.liquid"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists():
+        target.write_text("", encoding="utf-8")
+    lines = target.read_text(encoding="utf-8", errors="ignore").splitlines()
+    n = len(lines) + 1
+    header = "diff --git a/src/full.liquid b/src/full.liquid\n--- a/src/full.liquid\n+++ b/src/full.liquid\n"
+    hunk = f"@@ -{n},0 +{n},1 @@\n"
+    body = "+<!-- autopatch noop: adjust layout later -->\n"
+    return header + hunk + body
+
 def diff_targets_allowed_paths(diff_text: str) -> bool:
     ok = True
     for m in re.finditer(r"^\+\+\+ b/(.+)$", diff_text, re.M):
@@ -146,10 +154,19 @@ def diff_targets_allowed_paths(diff_text: str) -> bool:
     return ok
 
 def apply_unified_diff(diff_text: str):
-    if not re.search(r"^diff --git a/", diff_text, re.M):
-        return False, "Missing unified diff header."
+    artifacts = ROOT / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    last = artifacts / "last_diff.patch"
+
+    # log whatever we’re about to try
+    last.write_text(diff_text, encoding="utf-8")
+    print(f"📝 wrote patch to {last}")
+
+    if not is_valid_diff(diff_text):
+        return False, "Invalid diff (missing hunks/+/-)."
     if not diff_targets_allowed_paths(diff_text):
         return False, "Diff targets blocked paths."
+
     with tempfile.TemporaryDirectory() as td:
         patch = pathlib.Path(td) / "patch.diff"
         patch.write_text(diff_text, encoding="utf-8")
@@ -159,6 +176,13 @@ def apply_unified_diff(diff_text: str):
     return True, "Applied."
 
 def main():
+    # preflight: Pillow
+    try:
+        import PIL  # noqa
+    except Exception:
+        print("Missing Pillow. Install with: pip install pillow", file=sys.stderr)
+        sys.exit(2)
+
     start_sim()
     take_screenshot()
 
@@ -171,15 +195,24 @@ def main():
         print(f"\n=== Patch Attempt {i}/{MAX_ATTEMPTS} ===")
         prompt = make_prompt(read_snapshot(), acceptance_hint)
 
-        if USE_LOCAL_MODE:
-            diff_text = call_local_caption_and_diff(SCREENSHOT_PATH, prompt)
-        else:
+        if not USE_LOCAL_MODE:
             print("Remote HF API mode disabled in this build.")
             sys.exit(1)
+
+        print("🧠 Calling local caption+diff (BLIP + FLAN-T5)…")
+        diff_text = call_local_caption_and_diff(SCREENSHOT_PATH, prompt)
+
+        if not is_valid_diff(diff_text):
+            print("ℹ️ Model did not return a valid unified diff. First 400 chars:\n" + diff_text[:400])
+            print("↪︎ Falling back to a safe no-op diff.")
+            diff_text = synthesize_noop_diff()
 
         ok, msg = apply_unified_diff(diff_text)
         print(("✅" if ok else "❌"), msg)
         if not ok:
+            # if even the no-op fails (shouldn’t), bail after logging
+            if not is_valid_diff(diff_text):
+                print("Saved invalid diff at artifacts/last_diff.patch")
             time.sleep(2)
             continue
 
