@@ -145,10 +145,22 @@ def make_prompt(snap: dict[str, str], hint: str) -> str:
     )
 
 # ===== Local caption + diff =====
+def _safe_caption_pipeline(model_id: str):
+    from transformers import pipeline
+    # First try (default): prefers safetensors if present
+    try:
+        return pipeline("image-to-text", model=model_id, device="cpu")
+    except Exception as e:
+        msg = str(e)
+        # Fallback: some older checkpoints (e.g., BLIP base) only have .bin
+        if "model.safetensors" in msg or "safetensors" in msg.lower():
+            return pipeline("image-to-text", model=model_id, device="cpu", use_safetensors=False)
+        raise
+
 def call_local_caption_and_diff(image_path: pathlib.Path, prompt: str) -> str:
     # Caption the screenshot
     from transformers import pipeline, AutoTokenizer
-    cap = pipeline(
+    cap = _safe_caption_pipeline(
         "image-to-text",
         model=CAPTION_MODEL_ID,
         model_kwargs={"use_safetensors": True}
