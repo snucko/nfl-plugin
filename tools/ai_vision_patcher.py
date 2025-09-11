@@ -305,6 +305,14 @@ def main():
         break
 
     print("Done.")
-
 if __name__ == "__main__":
-    main()
+    try:
+        print("✅ Patcher started")
+        main()
+    except Exception as e:
+        import traceback, sys
+        ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+        err = traceback.format_exc()
+        (ARTIFACTS_DIR / "error.txt").write_text(err, encoding="utf-8")
+        print(err, file=sys.stderr)
+        sys.exit(1)
