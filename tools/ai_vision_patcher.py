@@ -60,7 +60,6 @@ TEXT_MODEL_ID = os.getenv("TEXT_MODEL_ID", "google/flan-t5-base")
 TEXT_MODEL_ARCH = os.getenv("TEXT_MODEL_ARCH", "seq2seq").lower()  # "seq2seq" or "causal"
 
 # Prefer safetensors everywhere (helps avoid torch.load on .bin)
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
 # ===== Utilities =====
 def run(cmd: str, check: bool = True) -> subprocess.CompletedProcess:
