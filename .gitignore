@@ -14,3 +14,14 @@ node_modules/
 # build/output
 artifacts/
 playwright/.cache/
+# runtime / cache
+.gh-cache/
+artifacts/
+.venv/
+node_modules/
+__pycache__/
+*.lock
+# model weights or blobs
+*.safetensors
+*.bin
+*.pt
