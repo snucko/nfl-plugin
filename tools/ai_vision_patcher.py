@@ -1,223 +1,230 @@
 #!/usr/bin/env python3
+"""
+AI Vision Patcher for TRMNL plugin (local/inference-free mode)
+
+Flow:
+  1) Ensure TRMNL simulator is up (Docker).
+  2) Screenshot the running plugin UI via Playwright (tools/shot.js).
+  3) Use a *local* caption model (image->text) to describe UI.
+  4) Feed caption + repo inventory + acceptance hint to a *local* text model
+     (FLAN-T5 or similar) to ask for a unified diff that fixes layout/data issues.
+  5) Validate + apply the patch, rebuild, and rescreenshot.
+
+Artifacts:
+  artifacts/plugin_screenshot.png
+  artifacts/raw_model_output.txt
+  artifacts/last_diff.patch
+  artifacts/error.txt (on failure)
+
+Notes:
+  - No HF token required; models are downloaded from HF Hub anonymously.
+  - Torch >= 2.6 enforced via workflow to satisfy HF security checks.
+"""
+
 import os
+import sys
+import json
+import time
+import shlex
 import pathlib
 import subprocess
-import time
-import requests
+from typing import Dict
 
-# -----------------------------------------------------------------------------
-# Environment & defaults
-# -----------------------------------------------------------------------------
+# ---------- Config via env ----------
 APP_URL = os.environ.get("APP_URL", "http://localhost:4567")
-TRMNL_CONTAINER_NAME = os.environ.get("TRMNL_CONTAINER_NAME", "trmnlp")
-AI_PATCH_MAX_ATTEMPTS = int(os.environ.get("AI_PATCH_MAX_ATTEMPTS", "3"))
+CONTAINER = os.environ.get("TRMNL_CONTAINER_NAME", "trmnlp")
 WAIT_BOOT_SECS = int(os.environ.get("WAIT_BOOT_SECS", "10"))
-ACCEPTANCE_HINT = os.environ.get(
-    "ACCEPTANCE_HINT",
-    "NFL games should render in the correct sections/columns with accurate team/date labels; no misplacements.",
-)
-
-# Local mode = use Transformers pipelines instead of HF Inference API
+ATTEMPTS = int(os.environ.get("AI_PATCH_MAX_ATTEMPTS", "3"))
 USE_LOCAL_MODE = os.environ.get("USE_LOCAL_MODE", "1") == "1"
 
-# Lighter defaults for CI reliability
 CAPTION_MODEL_ID = os.environ.get("CAPTION_MODEL_ID", "nlpconnect/vit-gpt2-image-captioning")
 TEXT_MODEL_ID = os.environ.get("TEXT_MODEL_ID", "google/flan-t5-base")
-TEXT_MODEL_ARCH = os.environ.get("TEXT_MODEL_ARCH", "seq2seq")  # or "causal"
+TEXT_MODEL_ARCH = os.environ.get("TEXT_MODEL_ARCH", "seq2seq")  # seq2seq or causal
 
-# Avoid requiring hf_transfer on runners
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+# Safety / caching
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+# Disable fast hf_transfer (avoids requiring hf_transfer package on CI)
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
-ARTIFACTS_DIR = pathlib.Path("artifacts")
+# ---------- Paths ----------
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+TOOLS = ROOT / "tools"
+ARTIFACTS_DIR = ROOT / "artifacts"
 SCREENSHOT_PATH = ARTIFACTS_DIR / "plugin_screenshot.png"
-LAST_DIFF_PATH = ARTIFACTS_DIR / "last_diff.patch"
 RAW_OUT_PATH = ARTIFACTS_DIR / "raw_model_output.txt"
-ERR_TXT = ARTIFACTS_DIR / "error.txt"
-SHOT_ERR = ARTIFACTS_DIR / "screenshot_err.txt"
+PATCH_PATH = ARTIFACTS_DIR / "last_diff.patch"
 
-# -----------------------------------------------------------------------------
-# Small helpers
-# -----------------------------------------------------------------------------
+# ---------- Helpers ----------
 def run(cmd: str, check: bool = True, capture_output: bool = False) -> subprocess.CompletedProcess:
     print(f"$ {cmd}")
-    try:
-        return subprocess.run(cmd, shell=True, check=check, capture_output=capture_output)
-    except subprocess.CalledProcessError as e:
-        # Preserve stderr/stdout to artifacts for easier debugging
-        ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-        if e.stdout:
-            (ARTIFACTS_DIR / "last_cmd_stdout.txt").write_text(
-                e.stdout.decode("utf-8", errors="ignore"), encoding="utf-8"
-            )
-        if e.stderr:
-            (ARTIFACTS_DIR / "last_cmd_stderr.txt").write_text(
-                e.stderr.decode("utf-8", errors="ignore"), encoding="utf-8"
-            )
-        raise
+    return subprocess.run(cmd, shell=True, check=check, capture_output=capture_output)
+
+def start_sim():
+    # start docker container if not running
+    run(f"docker rm -f {shlex.quote(CONTAINER)} >/dev/null 2>&1 || true", check=False)
+    run(
+        f"docker run --name {shlex.quote(CONTAINER)} -d -p 4567:4567 -v \"$PWD:/plugin\" trmnl/trmnlp serve",
+        check=True,
+    )
+    time.sleep(WAIT_BOOT_SECS)
 
 def take_screenshot():
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    # Capture stdout/stderr so Playwright issues land in artifacts/last_cmd_*.txt
-    run(f"node tools/shot.js {APP_URL} {SCREENSHOT_PATH}", capture_output=True)
+    # Requires tools/shot.js + Playwright chromium installed
+    run(f"node tools/shot.js {shlex.quote(APP_URL)} {shlex.quote(str(SCREENSHOT_PATH))}")
 
-def start_sim():
-    # Nuke old container (ignore errors), then start fresh
-    run(f"docker rm -f {TRMNL_CONTAINER_NAME} >/dev/null 2>&1 || true", check=False)
-    run(
-        f"docker run --name {TRMNL_CONTAINER_NAME} "
-        f"-d -p 4567:4567 -v \"$PWD:/plugin\" trmnl/trmnlp serve"
-    )
-    # Give it a head start
-    time.sleep(max(1, WAIT_BOOT_SECS))
-
-def wait_http_ready(url: str, timeout: int = 60, interval: float = 1.5) -> bool:
-    """Poll URL until we get any non-5xx response."""
-    deadline = time.time() + timeout
-    last_err = None
-    while time.time() < deadline:
+def repo_inventory() -> Dict[str, str]:
+    out = run("git ls-files", capture_output=True)
+    files = out.stdout.decode().strip().splitlines()
+    inv = {}
+    for rel in files:
+        p = ROOT / rel
         try:
-            r = requests.get(url, timeout=5)
-            if r.status_code < 500:  # 2xx/3xx/4xx means server is up
-                print(f"✅ App responding at {url} (status {r.status_code})")
-                return True
-        except Exception as e:
-            last_err = e
-        time.sleep(interval)
-    print(f"⚠️ App did not become ready at {url}: {last_err}")
-    return False
+            size = p.stat().st_size
+        except Exception:
+            size = 0
+        inv[rel] = f"{size}B"
+    return inv
 
-def make_prompt(snap: dict[str, str], hint: str) -> str:
+def make_prompt(snap: Dict[str, str], hint: str) -> str:
     inv = "\n".join(f"- {k}" for k in sorted(snap.keys()))
     return (
         "You are an automated code patcher for a TRMNL plugin.\n"
-        "Return ONLY a valid unified diff. No prose. No backticks. No explanations.\n"
+        "Return ONLY a valid unified diff. No prose. No backticks.\n"
         "Your first line MUST be exactly: diff --git a/<path> b/<path>\n"
-        "Paths must be relative to repo root shown below.\n\n"
-        "Example format (for illustration only):\n"
-        "diff --git a/src/full.liquid b/src/full.liquid\n"
-        "--- a/src/full.liquid\n"
-        "+++ b/src/full.liquid\n"
-        "@@ -1,3 +1,4 @@\n"
-        "-<div class=\"title\">Old</div>\n"
-        "+<!-- patch -->\n"
-        "+<div class=\"title\">Old</div>\n"
-        " <div class=\"body\">...</div>\n"
-        "\n"
+        "Paths must be repo-relative. Keep changes minimal and targeted.\n\n"
         "Repo file inventory:\n" + inv + "\n\n"
         "Acceptance:\n" + hint + "\n"
     )
 
-# -----------------------------------------------------------------------------
-# Local caption + diff (Transformers pipelines)
-# -----------------------------------------------------------------------------
-def _safe_caption_pipeline(model=None, model_id=None, **kwargs):
+def _safe_caption_pipeline(model_id: str):
     """
-    Build an image-to-text pipeline. Accepts either `model` or `model_id`, plus **kwargs.
-    Falls back to use_safetensors=False when checkpoints lack safetensors.
+    Build an image-to-text pipeline. Falls back to non-safetensors checkpoints if needed.
     """
     from transformers import pipeline
-    mid = model_id or model
-    if not mid:
-        raise ValueError("Must provide `model_id` or `model`")
-
     try:
-        return pipeline("image-to-text", model=mid, device="cpu", **kwargs)
+        return pipeline("image-to-text", model=model_id, device="cpu")
     except Exception as e:
         msg = str(e)
         if "safetensors" in msg.lower():
-            # Retry without safetensors requirement
-            return pipeline("image-to-text", model=mid, device="cpu", use_safetensors=False, **kwargs)
+            return pipeline("image-to-text", model=model_id, device="cpu", use_safetensors=False)
         raise
 
-def call_local_caption_and_diff(image_path: pathlib.Path, prompt: str) -> str:
-    from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
+def caption_image(img_path: pathlib.Path) -> str:
+    print("🧠 Captioning screenshot…")
+    pipe = _safe_caption_pipeline(CAPTION_MODEL_ID)
+    out = pipe(str(img_path))
+    # standard pipeline returns list of {"generated_text": "..."}
+    if isinstance(out, list) and out and "generated_text" in out[0]:
+        return out[0]["generated_text"].strip()
+    if isinstance(out, str):
+        return out.strip()
+    return json.dumps(out)
 
-    # 1) Caption the screenshot
-    cap = _safe_caption_pipeline(model_id=CAPTION_MODEL_ID)
-    captions = cap(str(image_path))
-    caption_text = captions[0].get("generated_text", "") if captions else "(no caption)"
+def generate_patch(prompt: str) -> str:
+    """
+    Use a local text model to produce a unified diff.
+    TEXT_MODEL_ARCH = seq2seq (FLAN-T5 etc.) or causal (tiny GPT-like).
+    """
+    print(f"🧠 Generating patch with {TEXT_MODEL_ID} ({TEXT_MODEL_ARCH})…")
 
-    # 2) Ask text model to emit a unified diff based on caption + instructions
-    if TEXT_MODEL_ARCH == "seq2seq":
+    # Save raw output for debugging
+    RAW_OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    if TEXT_MODEL_ARCH.lower() == "seq2seq":
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
         tok = AutoTokenizer.from_pretrained(TEXT_MODEL_ID)
-        model = AutoModelForSeq2SeqLM.from_pretrained(TEXT_MODEL_ID)
-        text_pipe = pipeline("text2text-generation", model=model, tokenizer=tok)
-        full_prompt = (
-            f"Image description: {caption_text}\n\n"
-            f"{prompt}\n\n"
-            "Remember: output ONLY a valid unified diff starting with 'diff --git'."
-        )
-        out = text_pipe(full_prompt, max_new_tokens=512)
-        text = out[0]["generated_text"]
+        mdl = AutoModelForSeq2SeqLM.from_pretrained(TEXT_MODEL_ID)
+        input_ids = tok(prompt, return_tensors="pt", truncation=True).input_ids
+        out_ids = mdl.generate(input_ids, max_new_tokens=1024)
+        text = tok.decode(out_ids[0], skip_special_tokens=True)
     else:
+        # causal LM path
+        from transformers import AutoTokenizer, AutoModelForCausalLM
         tok = AutoTokenizer.from_pretrained(TEXT_MODEL_ID)
-        model = AutoModelForCausalLM.from_pretrained(TEXT_MODEL_ID)
-        text_pipe = pipeline("text-generation", model=model, tokenizer=tok)
-        full_prompt = (
-            f"Image description: {caption_text}\n\n"
-            f"{prompt}\n\n"
-            "Return ONLY a valid unified diff starting with 'diff --git'."
-        )
-        out = text_pipe(full_prompt, max_new_tokens=512, do_sample=False)
-        text = out[0]["generated_text"]
+        mdl = AutoModelForCausalLM.from_pretrained(TEXT_MODEL_ID)
+        input_ids = tok(prompt, return_tensors="pt", truncation=True).input_ids
+        out_ids = mdl.generate(input_ids, max_new_tokens=1024, do_sample=False)
+        text = tok.decode(out_ids[0], skip_special_tokens=True)
 
     RAW_OUT_PATH.write_text(text, encoding="utf-8")
-    return text
+    return text.strip()
 
-# -----------------------------------------------------------------------------
-# Main workflow
-# -----------------------------------------------------------------------------
+def ensure_unified_diff(text: str) -> str:
+    # Try to locate a unified diff header inside any surrounding text.
+    idx = text.find("diff --git a/")
+    if idx == -1:
+        raise ValueError("Missing unified diff header in model output.")
+    return text[idx:]
+
+def apply_patch(diff_text: str) -> bool:
+    PATCH_PATH.write_text(diff_text, encoding="utf-8")
+    try:
+        run(f"git apply -p0 {shlex.quote(str(PATCH_PATH))}")
+        return True
+    except subprocess.CalledProcessError as e:
+        print("❌ git apply failed:\n")
+        try:
+            err = e.stderr.decode()
+        except Exception:
+            err = str(e)
+        print(err)
+        return False
+
+# ---------- Main ----------
 def main():
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Start simulator first, then wait for readiness before any screenshot
+    # 1) Boot simulator & screenshot
     start_sim()
-    wait_http_ready(APP_URL, timeout=max(20, WAIT_BOOT_SECS + 20))
-
-    # Initial screenshot of current state
     take_screenshot()
 
-    for attempt in range(1, AI_PATCH_MAX_ATTEMPTS + 1):
-        print(f"\n=== Patch Attempt {attempt}/{AI_PATCH_MAX_ATTEMPTS} ===")
+    # 2) Build prompt from caption + repo inventory
+    acceptance = os.environ.get(
+        "ACCEPTANCE_HINT",
+        "NFL view must be correctly structured and labeled; no misplaced games."
+    )
+    caption = caption_image(SCREENSHOT_PATH)
+    inv = repo_inventory()
+    prompt = (
+        "Screenshot caption:\n"
+        f"{caption}\n\n"
+        + make_prompt(inv, acceptance)
+    )
 
-        if not USE_LOCAL_MODE:
-            raise RuntimeError("Remote HF API mode disabled in this build (USE_LOCAL_MODE=1 expected).")
+    # 3) Try up to N attempts
+    for attempt in range(1, ATTEMPTS + 1):
+        print(f"\n=== Patch Attempt {attempt}/{ATTEMPTS} ===")
+        try:
+            model_out = generate_patch(prompt)
+            diff_text = ensure_unified_diff(model_out)
+        except Exception as e:
+            # Persist error for CI logs, then fail fast on final attempt
+            ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+            (ARTIFACTS_DIR / "error.txt").write_text(str(e), encoding="utf-8")
+            if attempt == ATTEMPTS:
+                raise
+            else:
+                continue
 
-        diff_text = call_local_caption_and_diff(SCREENSHOT_PATH, ACCEPTANCE_HINT)
-
-        # Save model output regardless
-        LAST_DIFF_PATH.write_text(diff_text, encoding="utf-8")
-
-        if not diff_text.strip().startswith("diff --git"):
-            print("❌ Model did not return a unified diff header. See artifacts/raw_model_output.txt & last_diff.patch.")
-            # Try next attempt (lets model refine on the new screenshot)
+        ok = apply_patch(diff_text)
+        if not ok:
+            if attempt == ATTEMPTS:
+                raise SystemExit(1)
             continue
 
-        # Apply the patch; do not fail hard here (allow empty/no-op diffs)
-        run(f"git apply {LAST_DIFF_PATH}", check=False)
-        run('git commit -am "🤖 Local auto-patch for TRMNL NFL plugin" || true', check=False)
-
-        # Rebuild, wait, re-screenshot
+        # Commit changes and rebuild/screenshot to verify
+        run('git add -A && git commit -m "🤖 Local auto-patch for TRMNL NFL plugin" || true', check=False)
         start_sim()
-        wait_http_ready(APP_URL, timeout=max(20, WAIT_BOOT_SECS + 20))
         take_screenshot()
-
-        # One patch per run is enough; break here. Increase attempts if you want iterative refinement.
         break
 
     print("Done.")
 
-# -----------------------------------------------------------------------------
-# Entrypoint with error capture
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        import traceback, sys
+    except Exception as e:
+        import traceback
         ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-        err = traceback.format_exc()
-        ERR_TXT.write_text(err, encoding="utf-8")
-        print(err, file=sys.stderr)
+        (ARTIFACTS_DIR / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        print(traceback.format_exc(), file=sys.stderr)
         sys.exit(1)

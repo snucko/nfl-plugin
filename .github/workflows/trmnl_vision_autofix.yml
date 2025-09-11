@@ -1,104 +1,95 @@
-name: TRMNL Vision Auto-Fix
+name: trmnl-vision-autofix
 
 on:
-  push:
   workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - "src/**"
+      - "tools/**"
+      - ".github/workflows/trmnl_vision_autofix.yml"
 
 jobs:
-  autofix:
+  vision-autofix:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write  # allow pushing commits back
+    timeout-minutes: 30
+
     env:
-      # --- App & patcher behavior ---
-      USE_LOCAL_MODE: "1"     # use local transformers (no HF Inference API)
-      ACCEPTANCE_HINT: "NFL games should render in the correct sections/columns with accurate team/date labels; no misplacements."
-      APP_URL: "http://localhost:4567"
-      TRMNL_CONTAINER_NAME: "trmnlp"
-      AI_PATCH_MAX_ATTEMPTS: "3"
-      WAIT_BOOT_SECS: "10"
+      # ---- App / simulator ----
+      APP_URL: http://localhost:4567
+      TRMNL_CONTAINER_NAME: trmnlp
+      WAIT_BOOT_SECS: 10
+      AI_PATCH_MAX_ATTEMPTS: 3
+      ACCEPTANCE_HINT: NFL games should render in the correct sections/columns with accurate team/date labels; no misplacements.
 
-      # --- Models (lighter captioner for CI reliability) ---
-      CAPTION_MODEL_ID: "nlpconnect/vit-gpt2-image-captioning"
-      TEXT_MODEL_ID: "google/flan-t5-base"
-      TEXT_MODEL_ARCH: "seq2seq"  # or "causal"
+      # ---- Local (no external API) model choices ----
+      USE_LOCAL_MODE: "1"
+      CAPTION_MODEL_ID: nlpconnect/vit-gpt2-image-captioning
+      TEXT_MODEL_ID: google/flan-t5-base
+      TEXT_MODEL_ARCH: seq2seq
 
-      # --- HF/Transformers settings ---
-      TRANSFORMERS_VERBOSITY: "info"
+      # ---- Hugging Face caching / safety knobs ----
       HF_HUB_DISABLE_TELEMETRY: "1"
-      HF_HUB_ENABLE_HF_TRANSFER: "0"  # avoid requiring hf_transfer on runners
-
-      # --- Caches (keep them inside workspace) ---
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
       HF_HOME: ${{ github.workspace }}/.gh-cache/huggingface
       TRANSFORMERS_CACHE: ${{ github.workspace }}/.gh-cache/huggingface/transformers
       TORCH_HOME: ${{ github.workspace }}/.gh-cache/torch
+      TRANSFORMERS_VERBOSITY: info
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Prepare cache directories
-        run: |
-          mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE" "$TORCH_HOME" artifacts
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Python deps (CPU only)
+      - name: Install Python deps (CPU)
         run: |
           python -m pip install --upgrade pip
-          # Torch >=2.6 satisfies the CVE requirement; 2.8.0 cpu is stable on runners
-          pip install "torch==2.8.0" --index-url https://download.pytorch.org/whl/cpu
-          pip install "transformers>=4.41" "accelerate>=0.33" pillow requests
+          pip install "transformers>=4.41" "accelerate>=0.33" pillow
+          # Torch >= 2.6 required by HF’s torch.load CVE guard.
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu "torch>=2.6,<3"
 
-      - name: Install Node + Playwright (Chromium)
+      - name: Install Node + Playwright
         run: |
-          sudo apt-get update
-          sudo apt-get install -y npm
-          test -f package.json || npm init -y
-          npm install playwright
+          echo '{}' > package.json
+          npm i playwright
           npx --yes playwright install --with-deps chromium
 
-      - name: Configure git identity (for pushes)
+      - name: Start TRMNL simulator (Docker)
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
+          docker rm -f $TRMNL_CONTAINER_NAME >/dev/null 2>&1 || true
+          docker run --name $TRMNL_CONTAINER_NAME -d -p 4567:4567 -v "$PWD:/plugin" trmnl/trmnlp serve
+          sleep "$WAIT_BOOT_SECS"
+          docker ps -a
 
-      - name: Run vision patcher
-        shell: bash
+      - name: Run patcher
         run: |
-          set -euxo pipefail
-          python -u tools/ai_vision_patcher.py || {
-            echo "---- PATCHER FAILED; dumping artifacts ----"
-            ls -la artifacts || true
-            for f in artifacts/error.txt artifacts/raw_model_output.txt artifacts/last_diff.patch; do
-              if [[ -f "$f" ]]; then
-                echo "----- $f -----"
-                sed -n '1,200p' "$f" || true
-              fi
-            done
-            exit 1
-          }
+          set -e
+          python tools/ai_vision_patcher.py
 
-      - name: Commit and push changes (if any)
+      - name: Show artifacts (if any)
+        if: always()
+        run: |
+          echo "---- LIST ARTIFACTS ----"
+          ls -la artifacts || true
+          for f in artifacts/error.txt artifacts/raw_model_output.txt artifacts/last_diff.patch; do
+            if [ -f "$f" ]; then
+              echo "----- $f -----"
+              sed -n '1,200p' "$f"
+            fi
+          done
+
+      - name: Commit & push any changes
+        if: always()
         run: |
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
             git commit -m "🤖 Auto-fix from CI"
-            git push
+            # Ignore push failures (e.g., concurrent pushes)
+            git push || true
           else
             echo "No changes to commit."
           fi
-
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-            name: trmnl-autofix-artifacts
-            path: |
-              artifacts/**
-              .gh-cache/huggingface/transformers/*
-              .gh-cache/torch/*
-            if-no-files-found: ignore
